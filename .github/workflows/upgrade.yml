@@ -176,6 +176,26 @@ jobs:
             echo "Checking for ImagePullBackOff errors..."
             kubectl describe pods -n vela-system | grep -A 10 -B 10 "ImagePullBackOff\|ErrImagePull" || echo "No image pull errors found"
             
+            # Check for CrashLoopBackOff and get logs
+            echo "Checking for CrashLoopBackOff errors and pod logs..."
+            for pod in $(kubectl get pods -n vela-system -o name | grep vela-core); do
+              pod_name=$(echo $pod | cut -d'/' -f2)
+              pod_status=$(kubectl get $pod -n vela-system -o jsonpath='{.status.phase}')
+              container_statuses=$(kubectl get $pod -n vela-system -o jsonpath='{.status.containerStatuses[*].state}')
+              
+              echo "Pod $pod_name status: $pod_status"
+              echo "Container statuses: $container_statuses"
+              
+              # Get logs for crashed pods
+              if echo "$container_statuses" | grep -q "waiting\|terminated"; then
+                echo "Getting logs for crashed pod $pod_name:"
+                kubectl logs $pod -n vela-system --previous --tail=50 || echo "No previous logs available"
+                kubectl logs $pod -n vela-system --tail=50 || echo "No current logs available"
+                echo "Events for pod $pod_name:"
+                kubectl describe $pod -n vela-system | grep -A 20 "Events:" || echo "No events found"
+              fi
+            done
+            
             # Check what image the failing pod is trying to pull
             echo "Checking failing pod image details..."
             for pod in $(kubectl get pods -n vela-system -o name | grep vela-core); do
@@ -217,8 +237,15 @@ jobs:
           
           echo "Pod logs (if any pods exist):"
           for pod in $(kubectl get pods -n vela-system -o name | grep vela-core); do
-            echo "Logs for $pod:"
-            kubectl logs $pod -n vela-system --tail=50 || echo "Failed to get logs for $pod"
+            pod_name=$(echo $pod | cut -d'/' -f2)
+            echo "=== Logs for $pod ==="
+            echo "Current logs:"
+            kubectl logs $pod -n vela-system --tail=100 || echo "Failed to get current logs for $pod"
+            echo "Previous logs (if crashed):"
+            kubectl logs $pod -n vela-system --previous --tail=100 || echo "No previous logs for $pod"
+            echo "Pod events:"
+            kubectl describe $pod -n vela-system | grep -A 30 "Events:" || echo "No events for $pod"
+            echo "================================"
           done
           
           echo "Helm release status:"
