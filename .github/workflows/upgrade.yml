@@ -18,35 +18,11 @@ env:
   GO_VERSION: '1.23.8'
 
 jobs:
-  detect-noop:
-    permissions:
-      actions: write
-    runs-on: ubuntu-22.04
-    outputs:
-      noop: ${{ steps.noop.outputs.should_skip }}
-    steps:
-      - name: Detect No-op Changes
-        id: noop
-        uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          paths_ignore: '["**.md", "**.mdx", "**.png", "**.jpg"]'
-          do_not_skip: '["workflow_dispatch", "schedule", "push"]'
-        continue-on-error: true
-
   upgrade-tests:
-    needs: [detect-noop]
-    if: needs.detect-noop.outputs.noop != 'true'
     runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        k8s-version: ['v1.29.8']
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.k8s-version }}
-      cancel-in-progress: true
     steps:
       - name: Check out code
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@v4
 
       - name: Install tools
         run: |
@@ -56,217 +32,72 @@ jobs:
           sudo snap install helm --classic
 
       - name: Setup Go
-        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
 
       - name: Get dependencies
-        run: |
-          go get -v -t -d ./...
+        run: go get -v -t -d ./...
 
-      - name: Setup KinD with Kubernetes ${{ matrix.k8s-version }}
+      - name: Setup KinD with Kubernetes v1.29.8
         run: |
           go install sigs.k8s.io/kind@v0.24.0
           kind delete cluster || true
-          kind create cluster --image=kindest/node:${{ matrix.k8s-version }}
+          kind create cluster --image=kindest/node:v1.29.8
 
-      - name: Get Ginkgo
-        run: go install github.com/onsi/ginkgo/v2/ginkgo@v2.14.0
+      - name: Get latest KubeVela release tag (no v prefix)
+        id: get_latest_tag
+        run: |
+          TAG=$(curl -s https://api.github.com/repos/kubevela/kubevela/releases/latest | jq -r ".tag_name" | awk '{sub(/^v/, ""); print}')
+          echo "LATEST_TAG=$TAG" >> $GITHUB_ENV
 
-      - name: Build vela CLI
-        run: make vela-cli
-
-      - name: Install kustomize
-        run: make kustomize
-
-      - name: Install KubeVela v1.10.3
+      - name: Add KubeVela Helm repo
         run: |
           helm repo add kubevela https://kubevela.github.io/charts
           helm repo update
-          echo "Installing KubeVela v1.10.3..."
+
+      - name: Install KubeVela ${{ env.LATEST_TAG }}
+        run: |
           helm install --create-namespace -n vela-system kubevela kubevela/vela-core \
-            --version 1.10.3 \
+            --version ${{ env.LATEST_TAG }} \
             --timeout 10m \
             --wait
-          
-          echo "Checking initial installation status..."
+
+      - name: Post-install status
+        run: |
           kubectl get pods -n vela-system
           kubectl rollout status deployment/kubevela-vela-core -n vela-system --timeout=300s
-
-      - name: Check initial installation
-        run: |
-          ./bin/vela version
           kubectl get crd applications.core.oam.dev
 
-      - name: Build and load new image
+      - name: Check vela version
+        run: ./bin/vela version
+
+      - name: Build and load Docker image
         run: |
           mkdir -p $HOME/tmp/
-          echo "Building and loading Docker image..."
           TMPDIR=$HOME/tmp/ make image-load
-          
-          # Verify the image was built and loaded
-          COMMIT_HASH="git-$(git rev-parse --short HEAD)"
-          echo "Verifying image vela-core-test:$COMMIT_HASH exists..."
-          docker images | grep vela-core-test
-          
-          # Wait a moment for the image to be fully loaded
-          echo "Waiting for image to be fully loaded in kind cluster..."
-          sleep 5
-          
-          # Check if image is available in kind cluster
-          echo "Checking if image is loaded in kind cluster..."
-          docker exec kind-control-plane crictl images | grep vela-core-test || echo "Image not found in kind cluster"
-          
-          # Check for the specific tag
-          echo "Looking for specific tag: $COMMIT_HASH"
-          docker exec kind-control-plane crictl images | grep "$COMMIT_HASH" || echo "Specific tag not found"
-          
-          # Additional verification - list all images in kind cluster
-          echo "All images in kind cluster:"
-          docker exec kind-control-plane crictl images | head -20
 
-      - name: Upgrade KubeVela to current commit
+      - name: Get commit hash
+        id: commit_hash
         run: |
-          # Check if the image exists before upgrading
-          docker images | grep vela-core-test || echo "Warning: vela-core-test image not found"
-          
-          # Get the current commit hash for debugging (using git- prefix to match the build)
-          COMMIT_HASH="git-$(git rev-parse --short HEAD)"
-          echo "Upgrading to commit: $COMMIT_HASH"
-          
-          # Pre-upgrade diagnostics
-          echo "=== Pre-upgrade diagnostics ==="
-          echo "Current pods in vela-system:"
-          kubectl get pods -n vela-system -o wide
-          
-          echo "Current services in vela-system:"
-          kubectl get svc -n vela-system
-          
-          echo "Current webhook configurations:"
-          kubectl get validatingwebhookconfigurations | grep vela || echo "No vela validating webhooks found"
-          kubectl get mutatingwebhookconfigurations | grep vela || echo "No vela mutating webhooks found"
-          
-          echo "Checking current deployment status:"
-          kubectl describe deployment kubevela-vela-core -n vela-system | tail -20
-          
-          # Check if there are any resource constraints
-          echo "Node resources:"
-          kubectl top nodes || echo "Metrics not available"
-          kubectl describe nodes | grep -A 5 -B 5 "Allocated resources" || echo "Resource info not available"
-          
-          # Perform the upgrade with increased timeout and debug output
-          echo "=== Starting upgrade ==="
-          set +e  # Don't exit on error so we can debug
+          echo "COMMIT_HASH=git-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Upgrade KubeVela to local image
+        run: |
           helm upgrade kubevela ./charts/vela-core \
             --namespace vela-system \
             --set image.repository=vela-core-test \
-            --set image.tag=$COMMIT_HASH \
-            --set image.pullPolicy=Never \
-            --timeout 15m \
+            --set image.tag=${{ env.COMMIT_HASH }} \
+            --set image.pullPolicy=IfNotPresent \
+            --timeout 10m \
             --wait \
             --debug
-          
-          UPGRADE_EXIT_CODE=$?
-          if [ $UPGRADE_EXIT_CODE -ne 0 ]; then
-            echo "=== Upgrade failed, attempting manual verification ==="
-            echo "Checking if deployment is progressing..."
-            kubectl get pods -n vela-system
-            
-            # Check for ImagePullBackOff specifically
-            echo "Checking for ImagePullBackOff errors..."
-            kubectl describe pods -n vela-system | grep -A 10 -B 10 "ImagePullBackOff\|ErrImagePull" || echo "No image pull errors found"
-            
-            # Check for CrashLoopBackOff and get logs
-            echo "Checking for CrashLoopBackOff errors and pod logs..."
-            for pod in $(kubectl get pods -n vela-system -o name | grep vela-core); do
-              pod_name=$(echo $pod | cut -d'/' -f2)
-              pod_status=$(kubectl get $pod -n vela-system -o jsonpath='{.status.phase}')
-              container_statuses=$(kubectl get $pod -n vela-system -o jsonpath='{.status.containerStatuses[*].state}')
-              
-              echo "Pod $pod_name status: $pod_status"
-              echo "Container statuses: $container_statuses"
-              
-              # Get logs for crashed pods
-              if echo "$container_statuses" | grep -q "waiting\|terminated"; then
-                echo "Getting logs for crashed pod $pod_name:"
-                kubectl logs $pod -n vela-system --previous --tail=50 || echo "No previous logs available"
-                kubectl logs $pod -n vela-system --tail=50 || echo "No current logs available"
-                echo "Events for pod $pod_name:"
-                kubectl describe $pod -n vela-system | grep -A 20 "Events:" || echo "No events found"
-              fi
-            done
-            
-            # Check what image the failing pod is trying to pull
-            echo "Checking failing pod image details..."
-            for pod in $(kubectl get pods -n vela-system -o name | grep vela-core); do
-              echo "Pod $pod details:"
-              kubectl describe $pod -n vela-system | grep -A 5 -B 5 "Image:"
-            done
-            
-            # List available images in kind again
-            echo "Images available in kind cluster:"
-            docker exec kind-control-plane crictl images | grep vela-core-test || echo "No vela-core-test images found"
-            
-            kubectl rollout status deployment/kubevela-vela-core -n vela-system --timeout=300s || echo "Rollout status check failed"
-            
-            # Check if the issue is specifically with webhooks
-            echo "Checking webhook status..."
-            kubectl get validatingwebhookconfigurations
-            kubectl get mutatingwebhookconfigurations
-            
-            exit $UPGRADE_EXIT_CODE
-          fi
-          set -e
 
-      - name: Debug upgrade failure (if any)
-        if: failure()
+      - name: Post-upgrade status
         run: |
-          echo "=== Post-upgrade failure diagnostics ==="
-          echo "Current pods in vela-system:"
-          kubectl get pods -n vela-system -o wide
-          
-          echo "Pod events:"
-          kubectl get events -n vela-system --sort-by='.firstTimestamp' | tail -20
-          
-          echo "Webhook configurations:"
-          kubectl get validatingwebhookconfigurations | grep vela || echo "No vela validating webhooks found"
-          kubectl get mutatingwebhookconfigurations | grep vela || echo "No vela mutating webhooks found"
-          
-          echo "Deployment status:"
-          kubectl describe deployment kubevela-vela-core -n vela-system
-          
-          echo "Pod logs (if any pods exist):"
-          for pod in $(kubectl get pods -n vela-system -o name | grep vela-core); do
-            pod_name=$(echo $pod | cut -d'/' -f2)
-            echo "=== Logs for $pod ==="
-            echo "Current logs:"
-            kubectl logs $pod -n vela-system --tail=100 || echo "Failed to get current logs for $pod"
-            echo "Previous logs (if crashed):"
-            kubectl logs $pod -n vela-system --previous --tail=100 || echo "No previous logs for $pod"
-            echo "Pod events:"
-            kubectl describe $pod -n vela-system | grep -A 30 "Events:" || echo "No events for $pod"
-            echo "================================"
-          done
-          
-          echo "Helm release status:"
-          helm status kubevela -n vela-system || echo "Failed to get helm status"
-
-      - name: Verify upgrade
-        run: |
-          echo "Checking vela version after upgrade..."
           ./bin/vela version
-          
-          echo "Checking CRD status..."
-          kubectl get crd applications.core.oam.dev
-          
-          echo "Checking pod status in vela-system namespace..."
           kubectl get pods -n vela-system
-          
-          echo "Checking deployment rollout status..."
           kubectl rollout status deployment/kubevela-vela-core -n vela-system --timeout=300s
-          
-          echo "Describing deployment for debugging..."
-          kubectl describe deployment kubevela-vela-core -n vela-system
 
       - name: Run unit tests
         run: make test
