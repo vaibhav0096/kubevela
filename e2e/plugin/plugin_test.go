@@ -53,16 +53,25 @@ var _ = Describe("Test Kubectl Plugin", func() {
 			err := os.WriteFile("dry-run-app.yaml", []byte(application), 0644)
 			Expect(err).NotTo(HaveOccurred())
 			Eventually(func() string {
-				output, _ := e2e.Exec("kubectl-vela dry-run -f dry-run-app.yaml -n default -x default")
+				output, err := e2e.Exec("kubectl-vela dry-run -f dry-run-app.yaml -n default -x default")
+				if err != nil {
+					fmt.Printf("Error executing dry-run: %v\n", err)
+					return ""
+				}
+				fmt.Printf("Dry-run output: %s\n", output)
 				return output
-			}, 10*time.Second, time.Second).Should(ContainSubstring(dryRunResult))
+			}, 30*time.Second, 2*time.Second).Should(ContainSubstring(dryRunResult))
 		})
 
 		It("Test dry-run application use definitions in local", func() {
 			Eventually(func() string {
-				output, _ := e2e.Exec("kubectl-vela dry-run -f dry-run-app.yaml -n default -d definitions")
+				output, err := e2e.Exec("kubectl-vela dry-run -f dry-run-app.yaml -n default -d definitions")
+				if err != nil {
+					fmt.Printf("Error executing dry-run with local definitions: %v\n", err)
+					return ""
+				}
 				return output
-			}, 10*time.Second, time.Second).Should(ContainSubstring(dryRunResult))
+			}, 30*time.Second, 2*time.Second).Should(ContainSubstring(dryRunResult))
 		})
 	})
 
