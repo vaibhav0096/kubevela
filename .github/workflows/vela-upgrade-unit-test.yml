@@ -1,4 +1,4 @@
-name: Upgrade Test
+name: Upgrade unit Test
 
 on:
   push:
@@ -26,6 +26,7 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.k8s-version }}
       cancel-in-progress: true
+    
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -33,9 +34,16 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install make gcc jq ca-certificates curl gnupg -y
+          sudo apt-get install -y \
+            make \
+            gcc \
+            jq \
+            ca-certificates \
+            curl \
+            gnupg
           sudo snap install kubectl --classic
           sudo snap install helm --classic
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
@@ -49,11 +57,15 @@ jobs:
           go install sigs.k8s.io/kind@v0.24.0
           kind delete cluster || true
           kind create cluster --image=kindest/node:${{ matrix.k8s-version }}
+
       - name: Get latest KubeVela release tag (no v prefix)
         id: get_latest_tag
         run: |
-          TAG=$(curl -s https://api.github.com/repos/kubevela/kubevela/releases/latest | jq -r ".tag_name" | awk '{sub(/^v/, ""); print}')
+          TAG=$(curl -s https://api.github.com/repos/kubevela/kubevela/releases/latest | \
+                jq -r ".tag_name" | \
+                awk '{sub(/^v/, ""); print}')
           echo "LATEST_TAG=$TAG" >> $GITHUB_ENV
+
       - name: Get Ginkgo
         run: go install github.com/onsi/ginkgo/v2/ginkgo@v2.14.0
 
@@ -70,17 +82,20 @@ jobs:
         run: |
           helm repo add kubevela https://kubevela.github.io/charts
           helm repo update
+
       - name: Install KubeVela ${{ env.LATEST_TAG }}
         run: |
           helm install --create-namespace -n vela-system kubevela kubevela/vela-core \
             --version ${{ env.LATEST_TAG }} \
             --timeout 10m \
             --wait
+
       - name: Post-install status
         run: |
           kubectl get pods -n vela-system
           kubectl rollout status deployment/kubevela-vela-core -n vela-system --timeout=300s
           kubectl get crd applications.core.oam.dev
+
       - name: Check vela version
         run: ./bin/vela version
 
@@ -88,10 +103,12 @@ jobs:
         run: |
           mkdir -p $HOME/tmp/
           TMPDIR=$HOME/tmp/ make image-load
+
       - name: Get commit hash
         id: commit_hash
         run: |
           echo "COMMIT_HASH=git-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
       - name: Upgrade KubeVela to local image
         run: |
           helm upgrade kubevela ./charts/vela-core \
@@ -102,17 +119,12 @@ jobs:
             --timeout 10m \
             --wait \
             --debug
+
       - name: Post-upgrade status
         run: |
           ./bin/vela version
           kubectl get pods -n vela-system
           kubectl rollout status deployment/kubevela-vela-core -n vela-system --timeout=300s
+
       - name: Run unit tests
         run: make test
-
-    
-      - name: Cleanup images
-        if: ${{ always() }}
-        run: |
-          make image-cleanup
-          docker image prune -f --filter "until=24h"

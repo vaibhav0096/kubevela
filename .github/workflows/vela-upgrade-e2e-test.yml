@@ -1,4 +1,4 @@
-name: KubeVela Upgrade E2E Test
+name: Upgrade  e2e Test
 
 on:
   push:
@@ -18,44 +18,60 @@ env:
   GO_VERSION: '1.23.8'
 
 jobs:
-  upgrade-e2e-tests:
-    name: Upgrade E2E Tests (k8s ${{ matrix.k8s-version }})
+  upgrade-tests:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
     strategy:
       matrix:
         k8s-version: ['v1.29.8']
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.k8s-version }}
       cancel-in-progress: true
-
+    
     steps:
       # Setup and Dependencies
-      - name: Checkout repository
+      - name: Check out code
         uses: actions/checkout@v4
 
-      - name: Setup Go ${{ env.GO_VERSION }}
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-
-      - name: Install system dependencies
+      - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install make gcc jq ca-certificates curl gnupg -y
+          sudo apt-get install -y \
+            make \
+            gcc \
+            jq \
+            ca-certificates \
+            curl \
+            gnupg
           sudo snap install kubectl --classic
           sudo snap install helm --classic
 
-      - name: Install Go dependencies
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Get dependencies
         run: go get -v -t -d ./...
 
-      - name: Install test tools
+      # Kubernetes Setup
+      - name: Setup KinD with Kubernetes ${{ matrix.k8s-version }}
         run: |
           go install sigs.k8s.io/kind@v0.24.0
-          go install github.com/onsi/ginkgo/v2/ginkgo@v2.14.0
+          kind delete cluster || true
+          kind create cluster --image=kindest/node:${{ matrix.k8s-version }}
 
-      # Build Components
+      # KubeVela Setup
+      - name: Get latest KubeVela release tag (no v prefix)
+        id: get_latest_tag
+        run: |
+          TAG=$(curl -s https://api.github.com/repos/kubevela/kubevela/releases/latest | \
+                jq -r ".tag_name" | \
+                awk '{sub(/^v/, ""); print}')
+          echo "LATEST_TAG=$TAG" >> $GITHUB_ENV
+
+      - name: Get Ginkgo
+        run: go install github.com/onsi/ginkgo/v2/ginkgo@v2.14.0
+
       - name: Build vela CLI
         run: make vela-cli
 
@@ -65,25 +81,11 @@ jobs:
       - name: Install kustomize
         run: make kustomize
 
-      # Kubernetes Cluster Setup
-      - name: Setup KinD cluster with Kubernetes ${{ matrix.k8s-version }}
-        run: |
-          kind delete cluster || true
-          kind create cluster --image=kindest/node:${{ matrix.k8s-version }}
-          kubectl cluster-info
-
-      # KubeVela Installation
-      - name: Add KubeVela Helm repository
+      # Helm Operations
+      - name: Add KubeVela Helm repo
         run: |
           helm repo add kubevela https://kubevela.github.io/charts
           helm repo update
-
-      - name: Get latest KubeVela release version
-        id: get_latest_tag
-        run: |
-          TAG=$(curl -s https://api.github.com/repos/kubevela/kubevela/releases/latest | jq -r ".tag_name" | awk '{sub(/^v/, ""); print}')
-          echo "LATEST_TAG=$TAG" >> $GITHUB_ENV
-          echo "Installing KubeVela version: $TAG"
 
       - name: Install KubeVela ${{ env.LATEST_TAG }}
         run: |
@@ -92,26 +94,27 @@ jobs:
             --timeout 10m \
             --wait
 
-      - name: Verify KubeVela installation
+      - name: Post-install status
         run: |
           kubectl get pods -n vela-system
           kubectl rollout status deployment/kubevela-vela-core -n vela-system --timeout=300s
           kubectl get crd applications.core.oam.dev
-          ./bin/vela version
 
-      # Build and Upgrade
+      - name: Check vela version
+        run: ./bin/vela version
+
+      # Image Building and Upgrade
       - name: Build and load Docker image
         run: |
           mkdir -p $HOME/tmp/
           TMPDIR=$HOME/tmp/ make image-load
 
-      - name: Generate commit hash tag
+      - name: Get commit hash
         id: commit_hash
         run: |
           echo "COMMIT_HASH=git-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-          echo "Generated image tag: git-$(git rev-parse --short HEAD)"
 
-      - name: Upgrade KubeVela to local development image
+      - name: Upgrade KubeVela to local image
         run: |
           helm upgrade kubevela ./charts/vela-core \
             --namespace vela-system \
@@ -122,18 +125,36 @@ jobs:
             --wait \
             --debug
 
-      - name: Verify upgrade completion
+      - name: Post-upgrade status
         run: |
           ./bin/vela version
           kubectl get pods -n vela-system
           kubectl rollout status deployment/kubevela-vela-core -n vela-system --timeout=300s
 
-      # Test Execution
-      - name: Run E2E tests
-        run: make test
+      # E2E Testing
+      - name: Prepare for e2e tests
+        run: |
+          make e2e-cleanup
+          make e2e-setup-core
+          helm test -n vela-system kubevela --timeout 5m
 
+      - name: Run api e2e tests
+        run: make e2e-api-test
+
+      - name: Run addon e2e tests
+        run: make e2e-addon-test
+
+      - name: Run e2e tests
+        run: make e2e-test
+        
       # Cleanup
-      - name: Cleanup Docker images
+      - name: Stop kubevela and cleanup
+        run: make end-e2e
+
+      - name: Clean e2e profile
+        run: rm /tmp/e2e-profile.out
+
+      - name: Cleanup images
         if: ${{ always() }}
         run: |
           make image-cleanup
