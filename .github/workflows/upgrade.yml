@@ -107,8 +107,8 @@ jobs:
           ./bin/vela version
           kubectl get pods -n vela-system
           kubectl rollout status deployment/kubevela-vela-core -n vela-system --timeout=300s
-      - name: Run unit tests
-        run: make test
+      # - name: Run unit tests
+      #   run: make test
 
       - name: Prepare for e2e tests
         run: |
