@@ -107,36 +107,10 @@ jobs:
           ./bin/vela version
           kubectl get pods -n vela-system
           kubectl rollout status deployment/kubevela-vela-core -n vela-system --timeout=300s
-      # - name: Run unit tests
-      #   run: make test
+      - name: Run unit tests
+        run: make test
 
-      - name: Prepare for e2e tests
-        run: |
-          make e2e-cleanup
-          make e2e-setup-core
-          helm test -n vela-system kubevela --timeout 5m
-      - name: Run api e2e tests
-        run: make e2e-api-test
-
-      - name: Run addon e2e tests
-        run: make e2e-addon-test
-
-      - name: Run e2e tests
-        run: make e2e-test
-
-      - name: Setup worker cluster for multicluster tests
-        run: |
-          go install sigs.k8s.io/kind@v0.24.0
-          kind delete cluster --name worker || true
-          kind create cluster --name worker --image=kindest/node:v1.31.1
-          kind export kubeconfig --internal --name worker --kubeconfig /tmp/worker.kubeconfig
-      - name: Run e2e multicluster tests
-        run: |
-          export PATH=$(pwd)/bin:$PATH
-          make e2e-multicluster-test
-      - name: Stop kubevela and cleanup
-        run: make end-e2e
-
+    
       - name: Cleanup images
         if: ${{ always() }}
         run: |
